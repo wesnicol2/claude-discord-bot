@@ -1,0 +1,54 @@
+name: Security Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  security-tests:
+    name: Build & run 19-test security suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create runtime directories
+        run: |
+          mkdir -p workspace logs
+          sudo chown 1000:1000 workspace logs
+
+      - name: Build image
+        run: docker build -t claude-discord-bot:ci --target runtime .
+
+      - name: Start container
+        run: |
+          docker run -d \
+            --name claude-discord-bot \
+            --user 1000:1000 \
+            --read-only \
+            --tmpfs /tmp:size=100m,mode=1777,uid=1000,gid=1000 \
+            --tmpfs /run:size=10m,mode=755,uid=1000,gid=1000 \
+            --volume "$(pwd)/workspace:/workspace" \
+            --volume "$(pwd)/logs:/app/logs" \
+            --volume "$(pwd)/config:/config:ro" \
+            --volume "$(pwd)/claude-home:/home/node/.claude:ro" \
+            --security-opt no-new-privileges:true \
+            --cap-drop ALL \
+            --memory 512m \
+            --cpus 1.0 \
+            --pids-limit 100 \
+            claude-discord-bot:ci
+          sleep 3
+
+      - name: Run security test suite
+        run: bash scripts/test-security.sh
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs claude-discord-bot

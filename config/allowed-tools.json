@@ -1,0 +1,11 @@
+{
+  "_comment": "Claude Code tool allowlist – populated in Step 2 when CLAUDE.md profiles are defined.",
+  "_step": 1,
+  "version": "1",
+  "allowedTools": [],
+  "deniedTools": [
+    "Bash",
+    "computer",
+    "str_replace_based_edit_tool"
+  ]
+}

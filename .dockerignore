@@ -1,0 +1,9 @@
+.git
+.gitignore
+.env
+secrets/
+logs/
+workspace/
+node_modules/
+*.md
+.github/

@@ -1,0 +1,6 @@
+{
+  "_comment": "Claude Code global settings – Step 1 placeholder. Full policy set in Step 2.",
+  "env": {
+    "CLAUDE_TELEMETRY_DISABLED": "true"
+  }
+}

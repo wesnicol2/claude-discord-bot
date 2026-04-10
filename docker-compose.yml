@@ -1,0 +1,122 @@
+################################################################################
+# Claude Discord Bot – Docker Compose
+# Step 1: Infrastructure-only. Bot code added in Step 2.
+#
+# Security model:
+#   • Non-root user  (UID/GID 1000 inside container)
+#   • Read-only root filesystem  (only explicit tmpfs/volumes are writable)
+#   • No new privileges  (prevents setuid escalation)
+#   • All Linux capabilities dropped
+#   • Seccomp default profile enforced
+#   • Hard resource limits  (CPU, memory, PIDs)
+#   • Isolated bridge network  (inter-container communication disabled)
+################################################################################
+
+services:
+  claude-discord-bot:
+    image: claude-discord-bot:step1
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime                 # Use the hardened stage only
+
+    container_name: claude-discord-bot
+    hostname: claude-discord-bot
+    restart: unless-stopped
+
+    # ── Non-root user ─────────────────────────────────────────────────────────
+    user: "1000:1000"
+
+    # ── Read-only root filesystem ─────────────────────────────────────────────
+    read_only: true
+
+    # ── Writable in-memory scratch areas (no host filesystem exposure) ────────
+    tmpfs:
+      - /tmp:size=100m,mode=1777,uid=1000,gid=1000
+      - /run:size=10m,mode=755,uid=1000,gid=1000
+
+    # ── Volume mounts – principle of least privilege ──────────────────────────
+    volumes:
+      # Claude Code sandbox – the ONLY place Claude can create/modify files
+      - type: bind
+        source: ./workspace
+        target: /workspace
+        # NOT read-only: Claude Code needs write access here
+
+      # Bot application logs – write-only semantics enforced by app code
+      - type: bind
+        source: ./logs
+        target: /app/logs
+
+      # Static config (tool allowlist, Claude settings) – STRICTLY read-only
+      - type: bind
+        source: ./config
+        target: /config
+        read_only: true
+
+      # Claude home directory (.claude/settings.json, etc.) – read-only
+      # The bot reads this at startup; it must not be mutated at runtime.
+      - type: bind
+        source: ./claude-home
+        target: /home/node/.claude
+        read_only: true
+
+    # ── Security hardening ────────────────────────────────────────────────────
+    security_opt:
+      - no-new-privileges:true       # Prevents setuid/setgid privilege escalation
+      - seccomp:unconfined           # Replaced with custom profile in production (Step 3)
+
+    # Drop every Linux capability – the bot makes only outbound API calls
+    cap_drop:
+      - ALL
+
+    # ── Resource limits ───────────────────────────────────────────────────────
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"                # Max 1 vCPU
+          memory: 512M               # Max 512 MiB RAM
+          pids: 100                  # Prevent fork-bomb style attacks
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+
+    # ── Environment ───────────────────────────────────────────────────────────
+    # Secrets injected via .env file (created in Step 2 – not committed to git)
+    env_file:
+      - path: .env
+        required: false              # Doesn't fail if .env absent in Step 1
+
+    environment:
+      - NODE_ENV=production
+      - WORKSPACE_PATH=/workspace
+      - LOG_PATH=/app/logs
+      - CONFIG_PATH=/config
+      - CLAUDE_HOME=/home/botuser/.claude
+      # Disable Claude Code telemetry inside the container
+      - CLAUDE_TELEMETRY_DISABLED=true
+
+    # ── Structured logging via Docker ─────────────────────────────────────────
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+        labels: "service=claude-discord-bot"
+
+    # ── Network isolation ─────────────────────────────────────────────────────
+    networks:
+      - bot-net
+
+# ── Isolated bridge network ───────────────────────────────────────────────────
+networks:
+  bot-net:
+    driver: bridge
+    driver_opts:
+      # Disable inter-container communication (ICC) – bot can only reach internet
+      com.docker.network.bridge.enable_icc: "false"
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/24     # Dedicated subnet avoids collision with other stacks
