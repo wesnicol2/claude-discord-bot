@@ -14,7 +14,7 @@
 
 services:
   claude-discord-bot:
-    image: claude-discord-bot:step1
+    image: claude-discord-bot:step2
     build:
       context: .
       dockerfile: Dockerfile
@@ -93,9 +93,18 @@ services:
       - WORKSPACE_PATH=/workspace
       - LOG_PATH=/app/logs
       - CONFIG_PATH=/config
-      - CLAUDE_HOME=/home/botuser/.claude
+      - CLAUDE_HOME=/home/node/.claude
       # Disable Claude Code telemetry inside the container
       - CLAUDE_TELEMETRY_DISABLED=true
+      # Python runtime settings
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      # Discord filtering – also set in .env; these are non-secret defaults
+      - DISCORD_CHANNEL_ID=${DISCORD_CHANNEL_ID:-}
+      - DISCORD_ALLOWED_USERS=${DISCORD_ALLOWED_USERS:-}
+      # Bot tuning
+      - CLAUDE_TIMEOUT=${CLAUDE_TIMEOUT:-600}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-120}
 
     # ── Structured logging via Docker ─────────────────────────────────────────
     logging:

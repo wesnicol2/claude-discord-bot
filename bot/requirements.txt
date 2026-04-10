@@ -1,0 +1,3 @@
+# Claude Discord Bot – Python dependencies
+# Pin minor versions for reproducible builds; patch versions float for security fixes.
+discord.py>=2.3,<3.0

@@ -1,13 +1,16 @@
 #!/bin/sh
-# entrypoint.sh – Step 1 placeholder
-# In Step 2 this is replaced with the actual Discord bot launcher.
-# Current purpose: validate the runtime environment and keep the container alive
-# so security tests can be run against it.
+# entrypoint.sh – Step 2: launch the Claude Discord Bot
 set -eu
 
 echo "[entrypoint] Container started as uid=$(id -u) gid=$(id -g) user=$(id -un)"
 
-# Sanity-check mounts
+# ── Security assertion: refuse to run as root ──────────────────────────────────
+if [ "$(id -u)" -eq 0 ]; then
+  echo "[entrypoint] FATAL: running as root – refusing to start" >&2
+  exit 1
+fi
+
+# ── Validate required mounts ───────────────────────────────────────────────────
 for dir in /workspace /app/logs /config /home/node/.claude; do
   if [ -d "$dir" ]; then
     echo "[entrypoint] Mount OK: $dir"
@@ -17,11 +20,29 @@ for dir in /workspace /app/logs /config /home/node/.claude; do
   fi
 done
 
-# Verify we are NOT root
-if [ "$(id -u)" -eq 0 ]; then
-  echo "[entrypoint] FATAL: running as root – refusing to start" >&2
+# ── Validate claude CLI is present ────────────────────────────────────────────
+if ! command -v claude >/dev/null 2>&1; then
+  echo "[entrypoint] ERROR: claude CLI not found in PATH" >&2
   exit 1
 fi
+echo "[entrypoint] Claude CLI: $(claude --version 2>&1 | head -1)"
 
-echo "[entrypoint] All checks passed. Waiting for Step 2 bot code..."
-exec sleep infinity
+# ── Validate Python is present ────────────────────────────────────────────────
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[entrypoint] ERROR: python3 not found in PATH" >&2
+  exit 1
+fi
+echo "[entrypoint] Python: $(python3 --version)"
+
+# ── Validate required env vars ────────────────────────────────────────────────
+for var in DISCORD_TOKEN DISCORD_ALLOWED_USERS DISCORD_CHANNEL_ID ANTHROPIC_API_KEY; do
+  eval "val=\${${var}:-}"
+  if [ -z "$val" ]; then
+    echo "[entrypoint] ERROR: required environment variable $var is not set" >&2
+    exit 1
+  fi
+  echo "[entrypoint] Env OK: $var (set)"
+done
+
+echo "[entrypoint] All checks passed. Starting Discord bot..."
+exec python3 /app/bot.py

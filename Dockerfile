@@ -14,11 +14,13 @@ RUN npm install -g @anthropic-ai/claude-code@latest 2>&1 | tail -5
 ################################################################################
 FROM node:20-alpine AS runtime
 
-# ── Minimal OS tooling ────────────────────────────────────────────────────────
+# ── Minimal OS tooling + Python ───────────────────────────────────────────────
 RUN apk add --no-cache \
       tini \
       curl \
-      bind-tools && \
+      bind-tools \
+      python3 \
+      py3-pip && \
     # Remove package manager cache
     rm -rf /var/cache/apk/*
 
@@ -44,9 +46,22 @@ RUN mkdir -p \
 
 WORKDIR /app
 
+# ── Install Python dependencies (as root, before dropping privileges) ─────────
+COPY bot/requirements.txt /app/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
+
+# ── Copy bot source code ──────────────────────────────────────────────────────
+COPY --chown=node:node bot/ /app/
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 COPY --chown=node:node scripts/entrypoint.sh /entrypoint.sh
 RUN chmod 550 /entrypoint.sh
+
+# ── Python runtime flags ──────────────────────────────────────────────────────
+# PYTHONUNBUFFERED: flush stdout immediately (important for log streaming)
+# PYTHONDONTWRITEBYTECODE: skip .pyc files (required for read-only filesystem)
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 # ── Drop to non-root for all subsequent RUN and the default CMD ───────────────
 USER node

@@ -1,8 +1,16 @@
 {
-  "_comment": "Claude Code tool allowlist – populated in Step 2 when CLAUDE.md profiles are defined.",
-  "_step": 1,
+  "_comment": "Claude Code tool allowlist – Step 2. Edit allowedTools to expand/restrict capability.",
+  "_step": 2,
   "version": "1",
-  "allowedTools": [],
+  "allowedTools": [
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch"
+  ],
   "deniedTools": [
     "Bash",
     "computer",
