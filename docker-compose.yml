@@ -54,12 +54,13 @@ services:
         target: /config
         read_only: true
 
-      # Claude home directory (.claude/settings.json, etc.) – read-only
-      # The bot reads this at startup; it must not be mutated at runtime.
+      # Claude home directory (.claude/settings.json, CLAUDE.md, etc.)
+      # Must be WRITABLE: Claude Code writes session state, project indexes, and
+      # auto-memory here even in --print mode. read_only:true silently prevents
+      # all output. CLAUDE.md and settings.json are version-controlled on the host.
       - type: bind
         source: ./claude-home
         target: /home/node/.claude
-        read_only: true
 
     # ── Security hardening ────────────────────────────────────────────────────
     security_opt:

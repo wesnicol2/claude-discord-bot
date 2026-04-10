@@ -165,14 +165,34 @@ async def _invoke_claude_locked(
     """
     allowed_tools = load_allowed_tools()
 
-    cmd = ["claude", "--print", "--output-format", "text"]
+    # --bare: skips keychain reads, OAuth init, LSP, hooks, and auto-memory.
+    #   Without this, Claude Code hangs indefinitely in a TTY-less container
+    #   when HOME points to a directory with an existing .claude/ state dir.
+    # --no-session-persistence: each Discord message is an independent session.
+    cmd = [
+        "claude",
+        "--print",
+        "--output-format", "text",
+        "--bare",
+        "--no-session-persistence",
+    ]
     if allowed_tools:
         cmd += ["--allowedTools", ",".join(allowed_tools)]
 
+    # Load the CLAUDE.md profile explicitly (--bare disables auto-discovery).
+    # This file lives in the claude-home bind-mount at the canonical location.
+    claude_md = Path("/home/node/.claude/CLAUDE.md")
+    if claude_md.exists():
+        cmd += ["--append-system-prompt-file", str(claude_md)]
+        logger.info("Loading CLAUDE.md from %s", claude_md)
+    else:
+        logger.warning("CLAUDE.md not found at %s — running without custom profile", claude_md)
+
     env = {
         **os.environ,
-        "HOME":          "/home/node",
-        "CLAUDE_HOME":   "/home/node/.claude",
+        # HOME=/tmp gives Claude a writable scratch area without risking
+        # interference from the pre-existing /home/node/.claude/ state dir.
+        "HOME":          "/tmp",
         "NO_COLOR":      "1",
         "TERM":          "dumb",
         "PYTHONUNBUFFERED": "1",
