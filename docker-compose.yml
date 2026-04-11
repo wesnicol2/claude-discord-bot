@@ -14,11 +14,13 @@
 
 services:
   claude-discord-bot:
-    image: claude-discord-bot:step2
+    image: claude-discord-bot:latest
     build:
       context: .
       dockerfile: Dockerfile
       target: runtime                 # Use the hardened stage only
+      tags:
+        - claude-discord-bot:latest
 
     container_name: claude-discord-bot
     hostname: claude-discord-bot
