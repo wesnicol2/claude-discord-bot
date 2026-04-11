@@ -94,7 +94,9 @@ services:
       - WORKSPACE_PATH=/workspace
       - LOG_PATH=/app/logs
       - CONFIG_PATH=/config
-      - CLAUDE_HOME=/home/node/.claude
+      # ANTHROPIC_API_KEY is intentionally absent: bot uses Claude Pro OAuth
+      # credentials from /home/node/.claude/.credentials.json instead.
+      # Setting ANTHROPIC_API_KEY would override OAuth and require paid credits.
       # Disable Claude Code telemetry inside the container
       - CLAUDE_TELEMETRY_DISABLED=true
       # Python runtime settings

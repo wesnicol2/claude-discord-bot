@@ -165,38 +165,44 @@ async def _invoke_claude_locked(
     """
     allowed_tools = load_allowed_tools()
 
-    # --bare: skips keychain reads, OAuth init, LSP, hooks, and auto-memory.
-    #   Without this, Claude Code hangs indefinitely in a TTY-less container
-    #   when HOME points to a directory with an existing .claude/ state dir.
-    # --no-session-persistence: each Discord message is an independent session.
+    # --no-session-persistence: each Discord message is an independent session;
+    # prevents cross-message state leakage while keeping CLAUDE.md auto-discovery
+    # and OAuth credential loading intact (--bare would disable both).
     cmd = [
         "claude",
         "--print",
         "--output-format", "text",
-        "--bare",
         "--no-session-persistence",
     ]
     if allowed_tools:
         cmd += ["--allowedTools", ",".join(allowed_tools)]
 
-    # Load the CLAUDE.md profile explicitly (--bare disables auto-discovery).
-    # This file lives in the claude-home bind-mount at the canonical location.
+    # Auth: copy OAuth credentials to /tmp/.claude/ so Claude Code can find them.
+    # HOME=/tmp gives Claude a clean writable scratch space. We explicitly unset
+    # ANTHROPIC_API_KEY so Claude uses OAuth (Pro sub) rather than a pay-per-use key.
+    # CLAUDE.md is loaded via --append-system-prompt-file since auto-discovery
+    # looks in ~/. claude/ (=/tmp/.claude/) which won't have CLAUDE.md at runtime.
+    import shutil as _shutil
+    _claude_tmp = Path("/tmp/.claude")
+    _claude_tmp.mkdir(parents=True, exist_ok=True)
+    _creds_src = Path("/home/node/.claude/.credentials.json")
+    if _creds_src.exists():
+        _shutil.copy2(_creds_src, _claude_tmp / ".credentials.json")
+        (_claude_tmp / ".credentials.json").chmod(0o600)
+
     claude_md = Path("/home/node/.claude/CLAUDE.md")
     if claude_md.exists():
         cmd += ["--append-system-prompt-file", str(claude_md)]
-        logger.info("Loading CLAUDE.md from %s", claude_md)
-    else:
-        logger.warning("CLAUDE.md not found at %s — running without custom profile", claude_md)
 
     env = {
         **os.environ,
-        # HOME=/tmp gives Claude a writable scratch area without risking
-        # interference from the pre-existing /home/node/.claude/ state dir.
-        "HOME":          "/tmp",
-        "NO_COLOR":      "1",
-        "TERM":          "dumb",
+        "HOME":             "/tmp",
+        "NO_COLOR":         "1",
+        "TERM":             "dumb",
         "PYTHONUNBUFFERED": "1",
     }
+    # Remove API key so Claude Code falls back to OAuth credentials
+    env.pop("ANTHROPIC_API_KEY", None)
 
     logger.info(
         "Invoking Claude | msg_len=%d | tools=%s",

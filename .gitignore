@@ -5,6 +5,8 @@
 secrets/
 *.key
 *.pem
+# Claude Code OAuth credentials — auto-refreshed at runtime, never commit
+claude-home/.credentials.json
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime data — generated at runtime, not source

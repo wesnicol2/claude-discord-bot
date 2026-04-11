@@ -20,13 +20,21 @@ RUN apk add --no-cache \
       curl \
       bind-tools \
       python3 \
-      py3-pip && \
+      py3-pip \
+      ripgrep && \
     # Remove package manager cache
     rm -rf /var/cache/apk/*
 
 # ── Copy the globally-installed Claude Code from the builder stage ────────────
 COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=builder /usr/local/bin/claude       /usr/local/bin/claude
+
+# Claude Code resolves bundled ripgrep relative to its own __dirname.
+# Since we copied the binary to /usr/local/bin/ (not a symlink to node_modules),
+# __dirname is /usr/local/bin/ and it looks for vendor/ there.
+# Symlink vendor → actual node_modules location so Glob/Grep tools work.
+RUN ln -sf /usr/local/lib/node_modules/@anthropic-ai/claude-code/vendor \
+           /usr/local/bin/vendor
 
 # ── Create runtime directories with correct ownership ────────────────────────
 # Mount points are created here so Docker can validate bind-mount targets.
