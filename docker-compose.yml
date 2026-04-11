@@ -84,28 +84,32 @@ services:
 
 
     # ── Environment ───────────────────────────────────────────────────────────
-    # Secrets injected via .env file (created in Step 2 – not committed to git)
+    # Secrets and IDs come exclusively from .env (git-ignored, never committed).
+    # See .env.example for the full variable reference and descriptions.
     env_file:
       - path: .env
-        required: false              # Doesn't fail if .env absent in Step 1
+        required: true               # Bot cannot start without secrets
 
     environment:
+      # ── Runtime paths (non-secret, baked into image layout) ───────────────
       - NODE_ENV=production
       - WORKSPACE_PATH=/workspace
       - LOG_PATH=/app/logs
       - CONFIG_PATH=/config
-      # ANTHROPIC_API_KEY is intentionally absent: bot uses Claude Pro OAuth
-      # credentials from /home/node/.claude/.credentials.json instead.
-      # Setting ANTHROPIC_API_KEY would override OAuth and require paid credits.
-      # Disable Claude Code telemetry inside the container
+
+      # ── Claude Code behaviour ──────────────────────────────────────────────
+      # ANTHROPIC_API_KEY is intentionally absent here. The bot uses Claude Pro
+      # OAuth credentials from claude-home/.credentials.json. Declaring the key
+      # here (even empty) would let a shell-level value leak in accidentally.
       - CLAUDE_TELEMETRY_DISABLED=true
-      # Python runtime settings
+
+      # ── Python runtime ─────────────────────────────────────────────────────
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
-      # Discord filtering – also set in .env; these are non-secret defaults
-      - DISCORD_CHANNEL_ID=${DISCORD_CHANNEL_ID:-}
-      - DISCORD_ALLOWED_USERS=${DISCORD_ALLOWED_USERS:-}
-      # Bot tuning
+
+      # ── Tuning defaults (overridden by values in .env if present) ──────────
+      # These are listed here so the container starts correctly even if the
+      # operator omits them from .env.
       - CLAUDE_TIMEOUT=${CLAUDE_TIMEOUT:-600}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-120}
 
