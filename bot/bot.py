@@ -17,8 +17,11 @@ import asyncio
 import json
 import logging
 import os
+import pwd
 import sys
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 import discord
@@ -57,13 +60,22 @@ DISCORD_HARD_LIMIT  = 2000   # Discord's enforced limit
 DISCORD_CHUNK_SIZE  = 1900   # our safe limit (leaves room for formatting)
 CODE_BLOCK_OVERHEAD = 8      # len("```\n\n```")
 
+# ─── OAuth constants ────────────────────────────────────────────────────────────
+
+CREDENTIALS_PATH  = Path("/home/node/.claude/.credentials.json")
+OAUTH_CLIENT_ID   = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+TOKEN_ENDPOINT    = "https://api.anthropic.com/v1/oauth/token"
+REFRESH_MARGIN_MS = 5 * 60 * 1000   # refresh if token expires within 5 minutes
+REAUTH_TIMEOUT    = 300              # seconds to wait for user to sign in
+
 # ─── Logging ───────────────────────────────────────────────────────────────────
 
 _log_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
 try:
     _log_handlers.append(logging.FileHandler(Path(LOG_PATH) / "bot.log"))
 except OSError:
-    pass  # LOG_PATH may not exist in test environments
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,16 +87,34 @@ logger = logging.getLogger("claude-bot")
 # ─── Discord client ────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
-intents.message_content = True          # Privileged intent – must be enabled in portal
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Serialise Claude sessions: only one active request at a time
 _claude_lock = asyncio.Lock()
 
+# When True, the next invocation starts a fresh session instead of continuing
+_start_fresh: bool = False
+
+# Held for the entire duration of a re-auth flow; prevents parallel flows
+_auth_lock = asyncio.Lock()
+
+# When set, the next incoming message is treated as an OAuth code
+_pending_auth_code: asyncio.Future[str] | None = None
+
+# ─── Privilege helpers ─────────────────────────────────────────────────────────
+
+# Claude refuses --dangerously-skip-permissions / bypassPermissions when run as
+# root, so the claude subprocess must drop to the unprivileged node user.
+_node_pw = pwd.getpwnam("node")
+
+def _drop_to_node() -> None:
+    os.setgid(_node_pw.pw_gid)
+    os.setuid(_node_pw.pw_uid)
+
 # ─── Allowed-tools config ──────────────────────────────────────────────────────
 
 def load_allowed_tools() -> list[str]:
-    """Read the tool allowlist from config/allowed-tools.json at call time."""
     cfg = Path(CONFIG_PATH) / "allowed-tools.json"
     try:
         data = json.loads(cfg.read_text())
@@ -98,13 +128,8 @@ def load_allowed_tools() -> list[str]:
 # ─── Response chunking ─────────────────────────────────────────────────────────
 
 def chunk_text(text: str, max_len: int = DISCORD_CHUNK_SIZE) -> list[str]:
-    """
-    Split *text* into a list of strings each no longer than *max_len* chars.
-    Prefers splitting on newline boundaries to avoid breaking code mid-line.
-    """
     if not text:
         return ["(no output)"]
-
     chunks: list[str] = []
     while len(text) > max_len:
         split_at = text.rfind("\n", 0, max_len)
@@ -112,105 +137,327 @@ def chunk_text(text: str, max_len: int = DISCORD_CHUNK_SIZE) -> list[str]:
             split_at = max_len
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
-
     if text:
         chunks.append(text)
-
     return chunks
 
 
-async def send_chunked(
-    channel: discord.abc.Messageable,
-    text: str,
-    total_parts: int | None = None,
-) -> None:
-    """Send *text* to *channel*, wrapping in code blocks and splitting as needed."""
+async def send_chunked(channel: discord.abc.Messageable, text: str) -> None:
     chunks = chunk_text(text)
     n = len(chunks)
-
     for i, chunk in enumerate(chunks, start=1):
-        part_suffix = f" — part {i}/{n}" if n > 1 else ""
-        header = f"**Claude{part_suffix}:**\n"
+        part_suffix = f" *(part {i}/{n})*" if n > 1 else ""
+        await channel.send(chunk + part_suffix)
 
-        # Use a fenced code block when content is multi-line or long
-        if "\n" in chunk or len(chunk) > 80:
-            # Ensure the whole message fits within Discord's hard limit
-            max_inner = DISCORD_HARD_LIMIT - len(header) - CODE_BLOCK_OVERHEAD
-            inner = chunk[:max_inner]
-            body = f"```\n{inner}\n```"
-        else:
-            body = chunk
+# ─── OAuth token management ─────────────────────────────────────────────────────
 
-        await channel.send(header + body)
+def _post_token(payload: dict) -> dict:
+    """Synchronous token endpoint call — run in a thread executor."""
+    # Log payload with secrets redacted
+    safe = {k: (v[:8] + "…" if k in ("code", "refresh_token", "code_verifier") and v else v)
+            for k, v in payload.items()}
+    logger.info("[token] POST %s  body=%s", TOKEN_ENDPOINT, safe)
+
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        TOKEN_ENDPOINT,
+        data=data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read()
+            logger.info("[token] Response %d: %s", resp.status, body[:300])
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        logger.error("[token] HTTP %d: %s", exc.code, body[:500])
+        raise
+
+
+def _save_credentials(access_token: str, refresh_token: str, expires_in: int) -> None:
+    expires_at_ms = int(time.time() * 1000 + expires_in * 1000)
+    try:
+        creds = json.loads(CREDENTIALS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        creds = {}
+    oauth = creds.get("claudeAiOauth", {})
+    oauth["accessToken"]  = access_token
+    oauth["refreshToken"] = refresh_token
+    oauth["expiresAt"]    = expires_at_ms
+    creds["claudeAiOauth"] = oauth
+    CREDENTIALS_PATH.write_text(json.dumps(creds))
+    logger.info("[token] Credentials saved — access token valid for %ds", expires_in)
+
+
+async def _ensure_token_fresh() -> bool:
+    """
+    Check the stored OAuth access token and refresh it if it's about to expire.
+
+    Returns True  if credentials are usable (fresh or successfully refreshed).
+    Returns False if the refresh token is invalid and full re-auth is needed.
+    """
+    try:
+        creds         = json.loads(CREDENTIALS_PATH.read_text())
+        oauth         = creds.get("claudeAiOauth", {})
+        refresh_token = oauth.get("refreshToken", "")
+        expires_at_ms = oauth.get("expiresAt", 0)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("[token] Could not read credentials: %s — re-auth needed", exc)
+        return False
+
+    now_ms      = time.time() * 1000
+    remaining_s = (expires_at_ms - now_ms) / 1000
+
+    if remaining_s > REFRESH_MARGIN_MS / 1000:
+        return True   # token is fresh — nothing to do
+
+    if not refresh_token:
+        logger.warning("[token] Token expired and no refresh_token — re-auth needed")
+        return False
+
+    logger.info("[token] Token expires in %.0fs — refreshing", remaining_s)
+    try:
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, _post_token, {
+            "grant_type":    "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id":     OAUTH_CLIENT_ID,
+        })
+        _save_credentials(data["access_token"], data["refresh_token"], data["expires_in"])
+        return True
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        logger.error("[token] Refresh HTTP %d: %s", exc.code, body[:300])
+        if exc.code in (400, 401):
+            # invalid_grant — refresh token revoked, need full re-auth
+            return False
+        return True   # temporary server error; try with existing token anyway
+    except Exception as exc:
+        logger.error("[token] Refresh error: %s", exc)
+        return True   # unknown error; try anyway rather than forcing re-auth
+
+
+async def _handle_reauth(channel: discord.abc.Messageable) -> bool:
+    """
+    Run `claude auth login` as a subprocess to perform a full re-authentication.
+
+    The CLI registers a server-side session with Anthropic and outputs a sign-in URL.
+    After the user signs in, Anthropic's callback page displays a `code#state` string.
+    The user pastes that into Discord; we feed it to the CLI's stdin to complete the
+    token exchange.  We also race against the process exiting on its own in case the
+    CLI completes via server-side polling.
+
+    Returns True on success, False on failure/timeout.
+    """
+    global _pending_auth_code
+
+    env = {
+        **os.environ,
+        "HOME":     "/home/node",
+        "SHELL":    "/bin/bash",
+        "NO_COLOR": "1",
+        "TERM":     "dumb",
+    }
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "auth", "login",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+            preexec_fn=_drop_to_node,
+        )
+    except FileNotFoundError:
+        await channel.send("**Error:** `claude` CLI not found.")
+        return False
+
+    assert proc.stdout is not None
+    assert proc.stdin is not None
+
+    # Drain stdout continuously so the process never blocks on its pipe.
+    url_ready: asyncio.Event = asyncio.Event()
+    url_value: list[str] = []
+
+    async def _read_output() -> None:
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                logger.info("[auth] %s", line)
+            if "https://" in line and not url_ready.is_set():
+                url_value.append(line[line.find("https://"):].strip())
+                url_ready.set()
+
+    read_task = asyncio.create_task(_read_output())
+
+    try:
+        await asyncio.wait_for(url_ready.wait(), timeout=30)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        read_task.cancel()
+        await channel.send("**Auth error:** No sign-in URL received within 30s. Check logs.")
+        return False
+
+    await channel.send(
+        f"**Authentication required.**\n"
+        f"Sign in at this link:\n{url_value[0]}\n\n"
+        f"*After signing in, Anthropic will show you a code that looks like* `XXXXXXXX#YYYYYYYY`\n"
+        f"*Copy the entire string and paste it here.*"
+    )
+    logger.info("[auth] Posted sign-in URL — waiting for code or process exit")
+
+    loop = asyncio.get_running_loop()
+    _pending_auth_code = loop.create_future()
+    proc_done   = asyncio.ensure_future(proc.wait())
+    code_pasted = asyncio.ensure_future(asyncio.shield(_pending_auth_code))
+
+    try:
+        done, _ = await asyncio.wait(
+            {proc_done, code_pasted},
+            timeout=REAUTH_TIMEOUT,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        _pending_auth_code = None
+
+    # ── Timeout ───────────────────────────────────────────────────────────────
+    if not done:
+        proc.kill()
+        await proc.wait()
+        proc_done.cancel()
+        code_pasted.cancel()
+        read_task.cancel()
+        logger.warning("[auth] Timed out waiting for sign-in")
+        await channel.send("**Auth timed out.** Send any message to try again.")
+        return False
+
+    # ── Path A: CLI exited on its own (server-side polling completed) ─────────
+    if proc_done in done:
+        code_pasted.cancel()
+        read_task.cancel()
+        try:
+            await read_task
+        except asyncio.CancelledError:
+            pass
+        rc = proc.returncode
+        if rc == 0:
+            logger.info("[auth] Completed via polling (no code needed)")
+            return True
+        logger.error("[auth] CLI exited %d before code was submitted", rc)
+        await channel.send(f"**Authentication failed** (exit {rc}). Send any message to try again.")
+        return False
+
+    # ── Path B: user pasted the code ─────────────────────────────────────────
+    try:
+        pasted = code_pasted.result()
+    except Exception as exc:
+        logger.error("[auth] Could not read pasted code: %s", exc)
+        proc.kill()
+        await proc.wait()
+        read_task.cancel()
+        await channel.send("**Auth error.** Send any message to try again.")
+        return False
+
+    # Pass the full pasted string including #state — the CLI needs both parts
+    full_input = pasted.strip()
+    logger.info("[auth] Submitting code to CLI stdin (%d chars)", len(full_input))
+    await channel.send("*Verifying…*")
+
+    try:
+        proc.stdin.write((full_input + "\n").encode())
+        await proc.stdin.drain()
+        proc.stdin.close()
+    except Exception as exc:
+        logger.error("[auth] stdin write failed: %s", exc)
+        proc.kill()
+        await proc.wait()
+        read_task.cancel()
+        await channel.send("**Auth error:** Could not submit code. Send any message to try again.")
+        return False
+
+    # Wait generously — token exchange can take time on slow networks
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        logger.error("[auth] Timed out after code submission")
+        await channel.send("**Auth timed out** after submitting the code. Send any message to try again.")
+        return False
+    finally:
+        read_task.cancel()
+        try:
+            await read_task
+        except asyncio.CancelledError:
+            pass
+
+    rc = proc.returncode
+    if rc == 0:
+        logger.info("[auth] Completed after code submission")
+        return True
+    logger.error("[auth] CLI exited %d after code submission", rc)
+    await channel.send(f"**Authentication failed** (exit {rc}). Send any message to try again.")
+    return False
 
 # ─── Claude invocation ─────────────────────────────────────────────────────────
 
-async def invoke_claude(message_text: str, channel: discord.abc.Messageable) -> None:
-    """Public entry point – queues behind the global lock."""
+async def invoke_claude(
+    message_text: str,
+    channel: discord.abc.Messageable,
+    new_session: bool = False,
+) -> None:
+    """
+    Public entry point.
+    Ensures the token is fresh, then runs Claude.
+    If the token cannot be refreshed, initiates a full re-auth flow first.
+    """
+    token_ok = await _ensure_token_fresh()
+
+    if not token_ok:
+        if _auth_lock.locked():
+            return   # another message already triggered re-auth
+        async with _auth_lock:
+            success = await _handle_reauth(channel)
+        if not success:
+            return
+        await channel.send("*Re-authenticated. Retrying your message…*")
+
     async with _claude_lock:
-        await _invoke_claude_locked(message_text, channel)
+        await _invoke_claude_locked(message_text, channel, new_session=new_session)
 
 
 async def _invoke_claude_locked(
     message_text: str,
     channel: discord.abc.Messageable,
+    new_session: bool = False,
 ) -> None:
     """
     Runs Claude Code CLI non-interactively.
-
-    • Message is written to Claude's stdin (avoids any argument-injection risk).
-    • stdout/stderr are streamed line-by-line; last_activity is updated on each line.
-    • A heartbeat coroutine fires every HEARTBEAT_INTERVAL seconds to post
-      a "still working" update and enforce the hard CLAUDE_TIMEOUT.
+    Caller must hold _claude_lock.
     """
     allowed_tools = load_allowed_tools()
 
-    # --no-session-persistence: each Discord message is an independent session;
-    # prevents cross-message state leakage while keeping CLAUDE.md auto-discovery
-    # and OAuth credential loading intact (--bare would disable both).
-    cmd = [
-        "claude",
-        "--print",
-        "--output-format", "text",
-        "--no-session-persistence",
-    ]
+    cmd = ["claude", "--print", "--output-format", "text", "--dangerously-skip-permissions"]
+    if not new_session:
+        cmd.append("--continue")
     if allowed_tools:
         cmd += ["--allowedTools", ",".join(allowed_tools)]
 
-    # Auth: copy OAuth credentials to /tmp/.claude/ so Claude Code can find them.
-    # HOME=/tmp gives Claude a clean writable scratch space. We explicitly unset
-    # ANTHROPIC_API_KEY so Claude uses OAuth (Pro sub) rather than a pay-per-use key.
-    # CLAUDE.md is loaded via --append-system-prompt-file since auto-discovery
-    # looks in ~/. claude/ (=/tmp/.claude/) which won't have CLAUDE.md at runtime.
-    import shutil as _shutil
-    _claude_tmp = Path("/tmp/.claude")
-    _claude_tmp.mkdir(parents=True, exist_ok=True)
-    _creds_src = Path("/home/node/.claude/.credentials.json")
-    if _creds_src.exists():
-        _shutil.copy2(_creds_src, _claude_tmp / ".credentials.json")
-        (_claude_tmp / ".credentials.json").chmod(0o600)
-
-    claude_md = Path("/home/node/.claude/CLAUDE.md")
-    if claude_md.exists():
-        cmd += ["--append-system-prompt-file", str(claude_md)]
-
     env = {
         **os.environ,
-        "HOME":             "/tmp",
+        "HOME":             "/home/node",
+        "SHELL":            "/bin/bash",
         "NO_COLOR":         "1",
         "TERM":             "dumb",
         "PYTHONUNBUFFERED": "1",
     }
-    # Remove API key so Claude Code falls back to OAuth credentials
     env.pop("ANTHROPIC_API_KEY", None)
 
-    logger.info(
-        "Invoking Claude | msg_len=%d | tools=%s",
-        len(message_text),
-        allowed_tools or "default",
-    )
+    logger.info("Invoking Claude | msg_len=%d | tools=%s", len(message_text), allowed_tools or "default")
 
-    # ── Spawn process ─────────────────────────────────────────────────────────
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -219,7 +466,8 @@ async def _invoke_claude_locked(
             stderr=asyncio.subprocess.PIPE,
             cwd=WORKSPACE_PATH,
             env=env,
-            limit=4 * 1024 * 1024,   # 4 MiB stream buffer
+            limit=4 * 1024 * 1024,
+            preexec_fn=_drop_to_node,
         )
     except FileNotFoundError:
         await channel.send("**Error:** `claude` CLI not found. Check the Docker image.")
@@ -229,7 +477,6 @@ async def _invoke_claude_locked(
         await channel.send(f"**Error:** Cannot execute `claude`: {exc}")
         return
 
-    # ── Feed message via stdin ────────────────────────────────────────────────
     assert proc.stdin is not None
     try:
         proc.stdin.write(message_text.encode("utf-8"))
@@ -237,26 +484,22 @@ async def _invoke_claude_locked(
     finally:
         proc.stdin.close()
 
-    # ── Shared state for heartbeat ────────────────────────────────────────────
     start_time        = time.monotonic()
-    last_activity_ref = [time.monotonic()]   # mutable container so coroutines can update it
+    last_activity_ref = [time.monotonic()]
     timed_out         = False
     stdout_lines: list[bytes] = []
     stderr_lines: list[bytes] = []
 
-    # ── Stream readers ────────────────────────────────────────────────────────
     async def drain(stream: asyncio.StreamReader, buf: list[bytes]) -> None:
         async for line in stream:
             buf.append(line)
             last_activity_ref[0] = time.monotonic()
 
-    # ── Heartbeat + timeout enforcer ──────────────────────────────────────────
     async def heartbeat() -> None:
         nonlocal timed_out
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             elapsed = time.monotonic() - start_time
-
             if elapsed >= CLAUDE_TIMEOUT:
                 timed_out = True
                 try:
@@ -264,16 +507,13 @@ async def _invoke_claude_locked(
                 except ProcessLookupError:
                     pass
                 await channel.send(
-                    f"**Timeout:** Claude did not finish within {CLAUDE_TIMEOUT}s. "
-                    "Request cancelled."
+                    f"**Timeout:** Claude did not finish within {CLAUDE_TIMEOUT}s. Request cancelled."
                 )
                 return
-
             idle = time.monotonic() - last_activity_ref[0]
             if idle >= HEARTBEAT_INTERVAL - 5:
                 await channel.send(f"*Still working… ({int(elapsed)}s elapsed)*")
 
-    # ── Run concurrently ──────────────────────────────────────────────────────
     assert proc.stdout is not None
     assert proc.stderr is not None
 
@@ -283,7 +523,6 @@ async def _invoke_claude_locked(
             drain(proc.stdout, stdout_lines),
             drain(proc.stderr, stderr_lines),
         )
-        # Give the process a moment to exit cleanly
         try:
             await asyncio.wait_for(proc.wait(), timeout=30)
         except asyncio.TimeoutError:
@@ -297,12 +536,11 @@ async def _invoke_claude_locked(
             pass
 
     if timed_out:
-        return   # Message already sent in heartbeat()
+        return
 
-    # ── Collect output ────────────────────────────────────────────────────────
-    stdout = b"".join(stdout_lines).decode("utf-8", errors="replace").strip()
-    stderr = b"".join(stderr_lines).decode("utf-8", errors="replace").strip()
-    rc     = proc.returncode
+    stdout  = b"".join(stdout_lines).decode("utf-8", errors="replace").strip()
+    stderr  = b"".join(stderr_lines).decode("utf-8", errors="replace").strip()
+    rc      = proc.returncode
     elapsed = time.monotonic() - start_time
 
     logger.info(
@@ -310,18 +548,14 @@ async def _invoke_claude_locked(
         rc, len(stdout), len(stderr), elapsed,
     )
 
-    # ── Handle errors ─────────────────────────────────────────────────────────
     if rc != 0 and not stdout:
         error_body = stderr or f"Claude exited with code {rc} and produced no output."
-        await channel.send(
-            f"**Claude error (exit {rc}):**\n```\n{error_body[:1800]}\n```"
-        )
+        await channel.send(f"**Claude error (exit {rc}):**\n```\n{error_body[:1800]}\n```")
         return
 
     if stderr:
         logger.warning("Claude stderr (rc=%d): %.400s", rc, stderr)
 
-    # ── Send response ─────────────────────────────────────────────────────────
     response = stdout or stderr or f"(Claude exited {rc} with no output)"
     await send_chunked(channel, response)
 
@@ -332,52 +566,64 @@ async def on_ready() -> None:
     assert bot.user
     logger.info(
         "Bot ready | tag=%s | id=%s | channel=%d | allowed_users=%s",
-        bot.user,
-        bot.user.id,
-        ALLOWED_CHANNEL_ID,
-        ALLOWED_USER_IDS,
+        bot.user, bot.user.id, ALLOWED_CHANNEL_ID, ALLOWED_USER_IDS,
     )
     await bot.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.watching,
-            name="for your messages",
-        )
+        activity=discord.Activity(type=discord.ActivityType.watching, name="for your messages")
     )
 
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    # Always ignore our own messages
     if message.author == bot.user:
         return
 
-    # ── Security gate ─────────────────────────────────────────────────────────
     if message.author.id not in ALLOWED_USER_IDS:
-        # Silent drop – do not reveal the bot is listening
         return
     if message.channel.id != ALLOWED_CHANNEL_ID:
         return
+
+    global _start_fresh, _pending_auth_code
 
     content = message.content.strip()
     if not content:
         return
 
+    # ── Auth code intercept ───────────────────────────────────────────────────
+    if _pending_auth_code is not None and not _pending_auth_code.done():
+        logger.info("[auth] Code received from Discord (%d chars)", len(content))
+        _pending_auth_code.set_result(content)
+        await message.channel.send("*Code received — exchanging for tokens…*")
+        return
+
+    # ── Auth in-progress guard ────────────────────────────────────────────────
+    if _auth_lock.locked():
+        await message.channel.send("*Authentication in progress — please wait.*")
+        return
+
+    # ── !new command ──────────────────────────────────────────────────────────
+    if content.lower() == "!new":
+        _start_fresh = True
+        await message.channel.send("Starting a fresh session on your next message.")
+        return
+
     logger.info(
         "Processing | user=%s (%d) | channel=%d | preview=%.120r",
-        message.author,
-        message.author.id,
-        message.channel.id,
-        content,
+        message.author, message.author.id, message.channel.id, content,
     )
 
-    # Acknowledge receipt with a clock reaction
+    new_session = _start_fresh
+    _start_fresh = False
+    if new_session:
+        logger.info("Starting new session as requested by !new")
+
     try:
         await message.add_reaction("⏳")
     except discord.HTTPException:
         pass
 
     try:
-        await invoke_claude(content, message.channel)
+        await invoke_claude(content, message.channel, new_session=new_session)
     except Exception as exc:
         logger.exception("Unhandled exception in invoke_claude: %s", exc)
         try:
@@ -385,13 +631,11 @@ async def on_message(message: discord.Message) -> None:
         except discord.HTTPException:
             pass
     finally:
-        # Remove the clock reaction regardless of outcome
         try:
             await message.remove_reaction("⏳", bot.user)
         except Exception:
             pass
 
-    # Allow prefix commands to work too (currently none defined beyond "!")
     await bot.process_commands(message)
 
 
@@ -412,7 +656,6 @@ if __name__ == "__main__":
 
     logger.info(
         "Starting Claude Discord Bot | channel=%d | allowed_users=%s",
-        ALLOWED_CHANNEL_ID,
-        ALLOWED_USER_IDS,
+        ALLOWED_CHANNEL_ID, ALLOWED_USER_IDS,
     )
-    bot.run(DISCORD_TOKEN, log_handler=None)   # We manage logging ourselves
+    bot.run(DISCORD_TOKEN, log_handler=None)

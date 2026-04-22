@@ -4,14 +4,8 @@ set -eu
 
 echo "[entrypoint] Container started as uid=$(id -u) gid=$(id -g) user=$(id -un)"
 
-# ── Security assertion: refuse to run as root ──────────────────────────────────
-if [ "$(id -u)" -eq 0 ]; then
-  echo "[entrypoint] FATAL: running as root – refusing to start" >&2
-  exit 1
-fi
-
 # ── Validate required mounts ───────────────────────────────────────────────────
-for dir in /workspace /app/logs /config /home/node/.claude; do
+for dir in /mnt/user /app/logs /config /home/node/.claude; do
   if [ -d "$dir" ]; then
     echo "[entrypoint] Mount OK: $dir"
   else
@@ -43,6 +37,25 @@ for var in DISCORD_TOKEN DISCORD_ALLOWED_USERS DISCORD_CHANNEL_ID; do
   fi
   echo "[entrypoint] Env OK: $var (set)"
 done
+
+# ── Ensure .claude.json exists for node user (doesn't persist across restarts) ─
+if [ ! -f "/home/node/.claude.json" ]; then
+  latest_backup=$(ls -t /home/node/.claude/backups/.claude.json.backup.* 2>/dev/null | head -1)
+  if [ -n "$latest_backup" ]; then
+    cp "$latest_backup" "/home/node/.claude.json"
+    echo "[entrypoint] Restored .claude.json from backup: $latest_backup"
+  else
+    echo '{}' > /home/node/.claude.json
+    echo "[entrypoint] Created empty .claude.json (no backup found)"
+  fi
+  chown node:node /home/node/.claude.json
+else
+  echo "[entrypoint] .claude.json OK"
+fi
+
+# ── Fix ownership so the node user (claude subprocess) can read/write claude files
+chown -R node:node /home/node/.claude
+echo "[entrypoint] Set /home/node/.claude ownership to node"
 
 # Auth: prefer Claude Pro OAuth credentials; fall back to API key
 if [ -f "/home/node/.claude/.credentials.json" ]; then

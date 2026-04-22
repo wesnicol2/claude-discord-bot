@@ -1,24 +1,10 @@
-################################################################################
-# Claude Discord Bot – Docker Compose
-# Step 1: Infrastructure-only. Bot code added in Step 2.
-#
-# Security model:
-#   • Non-root user  (UID/GID 1000 inside container)
-#   • Read-only root filesystem  (only explicit tmpfs/volumes are writable)
-#   • No new privileges  (prevents setuid escalation)
-#   • All Linux capabilities dropped
-#   • Seccomp default profile enforced
-#   • Hard resource limits  (CPU, memory, PIDs)
-#   • Isolated bridge network  (inter-container communication disabled)
-################################################################################
-
 services:
   claude-discord-bot:
     image: claude-discord-bot:latest
     build:
       context: .
       dockerfile: Dockerfile
-      target: runtime                 # Use the hardened stage only
+      target: runtime
       tags:
         - claude-discord-bot:latest
 
@@ -26,115 +12,95 @@ services:
     hostname: claude-discord-bot
     restart: unless-stopped
 
-    # ── Non-root user ─────────────────────────────────────────────────────────
-    user: "1000:1000"
+    # Run as root — required for Docker socket access and full filesystem ops
+    user: "0:0"
 
-    # ── Read-only root filesystem ─────────────────────────────────────────────
-    read_only: true
-
-    # ── Writable in-memory scratch areas (no host filesystem exposure) ────────
-    tmpfs:
-      - /tmp:size=100m,mode=1777,uid=1000,gid=1000
-      - /run:size=10m,mode=755,uid=1000,gid=1000
-
-    # ── Volume mounts – principle of least privilege ──────────────────────────
+    # ── Volume mounts ─────────────────────────────────────────────────────────
     volumes:
-      # Claude Code sandbox – the ONLY place Claude can create/modify files
+      # Full Unraid filesystem access
       - type: bind
-        source: ./workspace
-        target: /workspace
-        # NOT read-only: Claude Code needs write access here
+        source: /mnt/user
+        target: /mnt/user
 
-      # Bot application logs – write-only semantics enforced by app code
+      - type: bind
+        source: /mnt/cache
+        target: /mnt/cache
+
+      - type: bind
+        source: /boot
+        target: /boot
+        read_only: true
+
+      # Docker socket — allows managing containers
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+
+      # Bot application logs
       - type: bind
         source: ./logs
         target: /app/logs
 
-      # Static config (tool allowlist, Claude settings) – STRICTLY read-only
+      # Static config (tool allowlist) — read-only
       - type: bind
         source: ./config
         target: /config
         read_only: true
 
-      # Claude home directory (.claude/settings.json, CLAUDE.md, etc.)
-      # Must be WRITABLE: Claude Code writes session state, project indexes, and
-      # auto-memory here even in --print mode. read_only:true silently prevents
-      # all output. CLAUDE.md and settings.json are version-controlled on the host.
+      # Share claude-home with the claude-code container so OAuth credentials
+      # stay fresh — this instance refreshes them continuously during use
       - type: bind
-        source: ./claude-home
+        source: /mnt/user/appdata/claude-code/claude-home
         target: /home/node/.claude
 
-    # ── Security hardening ────────────────────────────────────────────────────
+    # ── Security ──────────────────────────────────────────────────────────────
     security_opt:
-      - no-new-privileges:true       # Prevents setuid/setgid privilege escalation
-      - seccomp:unconfined           # Replaced with custom profile in production (Step 3)
-
-    # Drop every Linux capability – the bot makes only outbound API calls
-    cap_drop:
-      - ALL
+      - no-new-privileges:true
+      - seccomp:unconfined
 
     # ── Resource limits ───────────────────────────────────────────────────────
     deploy:
       resources:
         limits:
-          cpus: "1.0"                # Max 1 vCPU
-          memory: 512M               # Max 512 MiB RAM
-          pids: 100                  # Prevent fork-bomb style attacks
+          cpus: "2.0"
+          memory: 1G
+          pids: 200
         reservations:
           cpus: "0.1"
-          memory: 64M
-
+          memory: 128M
 
     # ── Environment ───────────────────────────────────────────────────────────
-    # Secrets and IDs come exclusively from .env (git-ignored, never committed).
-    # See .env.example for the full variable reference and descriptions.
     env_file:
       - path: .env
-        required: true               # Bot cannot start without secrets
+        required: true
 
     environment:
-      # ── Runtime paths (non-secret, baked into image layout) ───────────────
       - NODE_ENV=production
-      - WORKSPACE_PATH=/workspace
+      - WORKSPACE_PATH=/mnt/user
       - LOG_PATH=/app/logs
       - CONFIG_PATH=/config
-
-      # ── Claude Code behaviour ──────────────────────────────────────────────
-      # ANTHROPIC_API_KEY is intentionally absent here. The bot uses Claude Pro
-      # OAuth credentials from claude-home/.credentials.json. Declaring the key
-      # here (even empty) would let a shell-level value leak in accidentally.
       - CLAUDE_TELEMETRY_DISABLED=true
-
-      # ── Python runtime ─────────────────────────────────────────────────────
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
-
-      # ── Tuning defaults (overridden by values in .env if present) ──────────
-      # These are listed here so the container starts correctly even if the
-      # operator omits them from .env.
       - CLAUDE_TIMEOUT=${CLAUDE_TIMEOUT:-600}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-120}
+      - RADARR_URL=${RADARR_URL:-}
+      - RADARR_API_KEY=${RADARR_API_KEY:-}
+      - SONARR_URL=${SONARR_URL:-}
+      - SONARR_API_KEY=${SONARR_API_KEY:-}
+      - LIDARR_URL=${LIDARR_URL:-}
+      - LIDARR_API_KEY=${LIDARR_API_KEY:-}
+      - PROWLARR_URL=${PROWLARR_URL:-}
+      - PROWLARR_API_KEY=${PROWLARR_API_KEY:-}
+      - READARR_URL=${READARR_URL:-}
+      - READARR_API_KEY=${READARR_API_KEY:-}
 
-    # ── Structured logging via Docker ─────────────────────────────────────────
+    # ── Logging ───────────────────────────────────────────────────────────────
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
-        labels: "service=claude-discord-bot"
 
-    # ── Network isolation ─────────────────────────────────────────────────────
-    networks:
-      - bot-net
-
-# ── Isolated bridge network ───────────────────────────────────────────────────
-networks:
-  bot-net:
-    driver: bridge
-    driver_opts:
-      # Disable inter-container communication (ICC) – bot can only reach internet
-      com.docker.network.bridge.enable_icc: "false"
-    ipam:
-      driver: default
-      config:
-        - subnet: 172.30.0.0/24     # Dedicated subnet avoids collision with other stacks
+    # ── Network — default bridge so container can reach host services ─────────
+    network_mode: bridge

@@ -1,6 +1,4 @@
 {
-  "_comment": "Claude Code tool allowlist – Step 2. Edit allowedTools to expand/restrict capability.",
-  "_step": 2,
   "version": "1",
   "allowedTools": [
     "Read",
@@ -9,11 +7,10 @@
     "Glob",
     "Grep",
     "WebFetch",
-    "WebSearch"
+    "WebSearch",
+    "Bash"
   ],
   "deniedTools": [
-    "Bash",
-    "computer",
-    "str_replace_based_edit_tool"
+    "computer"
   ]
 }

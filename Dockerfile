@@ -19,6 +19,7 @@ RUN apk add --no-cache \
       tini \
       curl \
       bind-tools \
+      bash \
       python3 \
       py3-pip \
       ripgrep && \
