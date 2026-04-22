@@ -1,0 +1,13 @@
+{
+  "containers": [
+    "binhex-sonarr",
+    "binhex-radarr",
+    "binhex-prowlarr",
+    "binhex-privoxyvpn",
+    "plex",
+    "qbittorrent",
+    "official-pihole",
+    "audiobookshelf",
+    "claude-discord-bot"
+  ]
+}

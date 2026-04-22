@@ -24,6 +24,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+import healthcheck
+
 import discord
 from discord.ext import commands
 
@@ -52,6 +54,8 @@ ALLOWED_CHANNEL_ID = _int_env("DISCORD_CHANNEL_ID", 0)
 
 CLAUDE_TIMEOUT      = _int_env("CLAUDE_TIMEOUT", 600)       # seconds (10 min)
 HEARTBEAT_INTERVAL  = _int_env("HEARTBEAT_INTERVAL", 120)   # seconds (2 min)
+HEALTH_CHECK_INTERVAL = _int_env("HEALTH_CHECK_INTERVAL", 3600)  # seconds (1 hour)
+HEALTH_CHANNEL_ID   = _int_env("HEALTH_CHANNEL_ID", 0)      # defaults to ALLOWED_CHANNEL_ID
 WORKSPACE_PATH      = os.environ.get("WORKSPACE_PATH", "/workspace")
 LOG_PATH            = os.environ.get("LOG_PATH", "/app/logs")
 CONFIG_PATH         = os.environ.get("CONFIG_PATH", "/config")
@@ -124,6 +128,41 @@ def load_allowed_tools() -> list[str]:
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Could not load allowed-tools.json: %s", exc)
     return []
+
+
+def load_monitored_containers() -> list[str]:
+    # /config override takes priority; fall back to the default baked into the image
+    for path in [Path(CONFIG_PATH) / "monitored-containers.json", Path("/app/monitored-containers.json")]:
+        try:
+            data = json.loads(path.read_text())
+            containers = data.get("containers", [])
+            if isinstance(containers, list):
+                return [str(c) for c in containers if c]
+        except (OSError, json.JSONDecodeError):
+            continue
+    return []
+
+
+async def health_check_loop() -> None:
+    """Background task: run health checks on a fixed interval, alert on Discord."""
+    await asyncio.sleep(30)  # let the bot fully connect first
+    channel_id = HEALTH_CHANNEL_ID or ALLOWED_CHANNEL_ID
+    while True:
+        try:
+            channel = bot.get_channel(channel_id)
+            if channel:
+                monitored = load_monitored_containers()
+                alert = healthcheck.run(monitored)
+                if alert:
+                    await send_chunked(channel, alert)
+                    logger.info("Health check alert posted to Discord")
+                else:
+                    logger.info("Health check: all systems OK")
+            else:
+                logger.warning("Health check: channel %d not found", channel_id)
+        except Exception as exc:
+            logger.exception("Health check loop error: %s", exc)
+        await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
 # ─── Response chunking ─────────────────────────────────────────────────────────
 
@@ -571,6 +610,7 @@ async def on_ready() -> None:
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.watching, name="for your messages")
     )
+    asyncio.create_task(health_check_loop())
 
 
 @bot.event
@@ -605,6 +645,13 @@ async def on_message(message: discord.Message) -> None:
     if content.lower() == "!new":
         _start_fresh = True
         await message.channel.send("Starting a fresh session on your next message.")
+        return
+
+    # ── !health command ───────────────────────────────────────────────────────
+    if content.lower() == "!health":
+        monitored = load_monitored_containers()
+        report = healthcheck.status_report(monitored)
+        await send_chunked(message.channel, report)
         return
 
     logger.info(
